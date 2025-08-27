@@ -1,0 +1,463 @@
+//+------------------------------------------------------------------+
+//| AI_XAU_M5.mq5                                                   |
+//| AI Trading Expert Advisor for XAU/USD M5                       |
+//+------------------------------------------------------------------+
+#property copyright "AI Trading System"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+// Global trade object
+CTrade trade;
+
+//--- Input parameters
+input string   ApiUrl = "http://127.0.0.1:5000/predict";
+input int      CandlesToSend = 60;      // Number of last M5 candles to send
+input double   RiskPct = 0.01;          // 1% risk per trade
+input double   MaxLots = 5.0;           // Maximum lot size
+input double   Threshold = 0.62;        // AI confidence threshold
+input int      MagicNumber = 123456;    // Magic number for trades
+input bool     EnableLogging = true;    // Enable detailed logging
+
+//--- Global variables
+datetime last_bar_time = 0;
+bool     web_request_allowed = false;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   Print("=== AI XAU Trading EA Initialized ===");
+   Print("Symbol: ", _Symbol);
+   Print("Timeframe: M5");
+   Print("API URL: ", ApiUrl);
+   Print("Risk per trade: ", RiskPct * 100, "%");
+   Print("Max lots: ", MaxLots);
+   Print("Threshold: ", Threshold);
+   
+   // Set magic number for trade operations
+   trade.SetExpertMagicNumber(MagicNumber);
+   
+   // Check if WebRequest is allowed
+   if(!TerminalInfoInteger(TERMINAL_DLLS_ALLOWED))
+   {
+      Alert("Please enable 'Allow WebRequest' in Tools->Options->Expert Advisors");
+      return INIT_FAILED;
+   }
+   
+   // Test API connection
+   TestApiConnection();
+   
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("=== AI XAU Trading EA Deinitialized ===");
+   Print("Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Check for new bar on M5 timeframe
+   datetime cur_bar = iTime(_Symbol, PERIOD_M5, 0);
+   if(cur_bar == last_bar_time) 
+      return;
+   
+   last_bar_time = cur_bar;
+   
+   if(EnableLogging)
+      Print("=== New M5 Bar - Processing AI Signal ===");
+   
+   // Get historical rates
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(_Symbol, PERIOD_M5, 0, CandlesToSend, rates);
+   
+   if(copied < CandlesToSend) 
+   {
+      Print("ERROR: Not enough bars copied. Required: ", CandlesToSend, ", Got: ", copied);
+      return;
+   }
+   
+   // Build JSON payload
+   string json_payload = BuildJsonFromRates(rates, CandlesToSend);
+   
+   if(EnableLogging)
+      Print("JSON Payload length: ", StringLen(json_payload));
+   
+   // Send request to AI server
+   string ai_response = SendApiRequest(json_payload);
+   
+   if(ai_response == "")
+   {
+      Print("ERROR: Empty response from AI server");
+      return;
+   }
+   
+   // Parse AI response
+   ProcessAiResponse(ai_response);
+}
+
+//+------------------------------------------------------------------+
+//| Build JSON from rates data                                       |
+//+------------------------------------------------------------------+
+string BuildJsonFromRates(MqlRates &rates[], int count)
+{
+   string json_str = "{ \"ohlc\": [";
+   
+   // Send data from oldest to newest (reverse array order since it's series)
+   for(int i = count - 1; i >= 0; i--)
+   {
+      json_str += StringFormat("[%.5f,%.5f,%.5f,%.5f,%d]", 
+                              rates[i].open, 
+                              rates[i].high, 
+                              rates[i].low, 
+                              rates[i].close, 
+                              (int)rates[i].tick_volume);
+      
+      if(i > 0) 
+         json_str += ",";
+   }
+   
+   json_str += "], \"threshold\": " + DoubleToString(Threshold, 2) + " }";
+   
+   return json_str;
+}
+
+//+------------------------------------------------------------------+
+//| Send API request to Python server                               |
+//+------------------------------------------------------------------+
+string SendApiRequest(string json_payload)
+{
+   char post_data[];
+   char result_data[];
+   string result_headers;
+   
+   // Convert string to char array
+   StringToCharArray(json_payload, post_data, 0, WHOLE_ARRAY, CP_UTF8);
+   ArrayResize(post_data, ArraySize(post_data) - 1); // Remove null terminator
+   
+   // Set headers
+   string headers = "Content-Type: application/json\r\n";
+   
+   // Send HTTP POST request
+   int timeout = 10000; // 10 seconds timeout
+   int http_code = WebRequest("POST", ApiUrl, headers, timeout, post_data, result_data, result_headers);
+   
+   // Handle WebRequest errors
+   if(http_code == -1)
+   {
+      int error = GetLastError();
+      Print("ERROR: WebRequest failed. Error code: ", error);
+      Print("Make sure to add the URL to allowed URLs in Tools->Options->Expert Advisors->WebRequest");
+      return "";
+   }
+   
+   if(http_code != 200)
+   {
+      Print("ERROR: HTTP request failed. Code: ", http_code);
+      if(ArraySize(result_data) > 0)
+         Print("Response: ", CharArrayToString(result_data));
+      return "";
+   }
+   
+   // Convert response to string
+   string response = CharArrayToString(result_data, 0, WHOLE_ARRAY, CP_UTF8);
+   
+   if(EnableLogging)
+      Print("AI Response: ", response);
+   
+   return response;
+}
+
+//+------------------------------------------------------------------+
+//| Process AI response and execute trades                          |
+//+------------------------------------------------------------------+
+void ProcessAiResponse(string response)
+{
+   // Extract values from JSON response
+   string decision = ExtractJsonString(response, "decision");
+   double prob = ExtractJsonDouble(response, "prob");
+   double entry = ExtractJsonDouble(response, "entry");
+   double sl = ExtractJsonDouble(response, "sl");
+   double tp = ExtractJsonDouble(response, "tp");
+   
+   Print("AI Decision: ", decision, ", Probability: ", DoubleToString(prob, 3));
+   
+   // Check if we should trade
+   if(decision != "BUY" && decision != "SELL")
+   {
+      Print("AI recommends SKIP - Probability: ", DoubleToString(prob, 3));
+      return;
+   }
+   
+   // Check if there are existing positions
+   if(PositionsTotal() > 0)
+   {
+      Print("Position already exists - Skipping new trade");
+      return;
+   }
+   
+   // Calculate lot size based on risk management
+   double sl_distance = MathAbs(entry - sl);
+   double lot_size = CalculateLotSize(sl_distance);
+   
+   if(lot_size <= 0)
+   {
+      Print("ERROR: Invalid lot size calculated");
+      return;
+   }
+   
+   if(lot_size > MaxLots)
+   {
+      lot_size = MaxLots;
+      Print("Lot size capped at maximum: ", MaxLots);
+   }
+   
+   // Get current market prices
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   // Normalize prices
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   sl = NormalizeDouble(sl, digits);
+   tp = NormalizeDouble(tp, digits);
+   
+   // Execute trade
+   bool trade_result = false;
+   
+   if(decision == "BUY")
+   {
+      trade_result = trade.Buy(lot_size, _Symbol, ask, sl, tp, "AI BUY - Prob:" + DoubleToString(prob, 2));
+   }
+   else if(decision == "SELL")
+   {
+      trade_result = trade.Sell(lot_size, _Symbol, bid, sl, tp, "AI SELL - Prob:" + DoubleToString(prob, 2));
+   }
+   
+   // Log trade result
+   if(trade_result)
+   {
+      Print("=== TRADE EXECUTED ===");
+      Print("Direction: ", decision);
+      Print("Lot Size: ", DoubleToString(lot_size, 2));
+      Print("Entry: ", DoubleToString((decision == "BUY") ? ask : bid, digits));
+      Print("Stop Loss: ", DoubleToString(sl, digits));
+      Print("Take Profit: ", DoubleToString(tp, digits));
+      Print("Probability: ", DoubleToString(prob, 3));
+   }
+   else
+   {
+      Print("ERROR: Trade execution failed. Error: ", GetLastError());
+      Print("Trade details - Direction: ", decision, ", Lot: ", lot_size, ", SL: ", sl, ", TP: ", tp);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Extract string value from JSON                                   |
+//+------------------------------------------------------------------+
+string ExtractJsonString(string json_str, string key)
+{
+   string search_pattern = "\"" + key + "\":\"";
+   int start_pos = StringFind(json_str, search_pattern);
+   
+   if(start_pos < 0) 
+      return "";
+   
+   start_pos += StringLen(search_pattern);
+   int end_pos = StringFind(json_str, "\"", start_pos);
+   
+   if(end_pos < 0) 
+      return "";
+   
+   return StringSubstr(json_str, start_pos, end_pos - start_pos);
+}
+
+//+------------------------------------------------------------------+
+//| Extract double value from JSON                                   |
+//+------------------------------------------------------------------+
+double ExtractJsonDouble(string json_str, string key)
+{
+   string search_pattern = "\"" + key + "\":";
+   int start_pos = StringFind(json_str, search_pattern);
+   
+   if(start_pos < 0) 
+      return 0.0;
+   
+   start_pos += StringLen(search_pattern);
+   
+   // Find end of number (comma, closing brace, or end of string)
+   int end_pos1 = StringFind(json_str, ",", start_pos);
+   int end_pos2 = StringFind(json_str, "}", start_pos);
+   int end_pos = -1;
+   
+   if(end_pos1 < 0 && end_pos2 < 0)
+      end_pos = StringLen(json_str);
+   else if(end_pos1 < 0)
+      end_pos = end_pos2;
+   else if(end_pos2 < 0)
+      end_pos = end_pos1;
+   else
+      end_pos = MathMin(end_pos1, end_pos2);
+   
+   if(end_pos <= start_pos) 
+      return 0.0;
+   
+   string value_str = StringSubstr(json_str, start_pos, end_pos - start_pos);
+   
+   // Remove any whitespace
+   StringReplace(value_str, " ", "");
+   StringReplace(value_str, "\t", "");
+   StringReplace(value_str, "\n", "");
+   StringReplace(value_str, "\r", "");
+   
+   return StringToDouble(value_str);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size based on risk management                     |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double sl_distance_points)
+{
+   if(sl_distance_points <= 0)
+      return 0;
+   
+   double account_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk_amount = account_balance * RiskPct;
+   
+   // Get symbol specifications
+   double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   double lot_size = 0;
+   
+   if(tick_size > 0 && tick_value > 0)
+   {
+      // Calculate number of ticks in SL distance
+      double num_ticks = sl_distance_points / tick_size;
+      
+      // Calculate lot size based on risk
+      lot_size = risk_amount / (num_ticks * tick_value);
+   }
+   else
+   {
+      // Fallback calculation for XAU/USD
+      double point_value = 100.0; // Approximate value per point for 1 lot XAU/USD
+      lot_size = risk_amount / (sl_distance_points * point_value);
+   }
+   
+   // Normalize lot size to valid increments
+   if(lot_size < min_lot)
+      lot_size = min_lot;
+   else if(lot_size > max_lot)
+      lot_size = max_lot;
+   else
+   {
+      // Round to nearest valid lot step
+      lot_size = MathFloor(lot_size / lot_step) * lot_step;
+      if(lot_size < min_lot)
+         lot_size = min_lot;
+   }
+   
+   return NormalizeDouble(lot_size, 2);
+}
+
+//+------------------------------------------------------------------+
+//| Test API connection                                              |
+//+------------------------------------------------------------------+
+void TestApiConnection()
+{
+   Print("Testing API connection...");
+   
+   // Create simple test payload
+   string test_json = "{ \"test\": true }";
+   char post_data[];
+   char result_data[];
+   string result_headers;
+   
+   StringToCharArray(test_json, post_data, 0, WHOLE_ARRAY, CP_UTF8);
+   ArrayResize(post_data, ArraySize(post_data) - 1);
+   
+   string headers = "Content-Type: application/json\r\n";
+   int http_code = WebRequest("POST", ApiUrl, headers, 5000, post_data, result_data, result_headers);
+   
+   if(http_code == -1)
+   {
+      Print("WARNING: Cannot connect to AI server. Please check:");
+      Print("1. Python server is running on ", ApiUrl);
+      Print("2. URL is added to allowed URLs in MT5 settings");
+   }
+   else if(http_code == 200)
+   {
+      Print("SUCCESS: AI server connection established");
+   }
+   else
+   {
+      Print("WARNING: AI server responded with HTTP code: ", http_code);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Handle trade events                                              |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                       const MqlTradeRequest& request,
+                       const MqlTradeResult& result)
+{
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   {
+      if(HistoryDealSelect(trans.deal))
+      {
+         long deal_magic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+         if(deal_magic == MagicNumber)
+         {
+            double deal_profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+            string deal_symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+            
+            if(deal_profit != 0) // Position closed
+            {
+               Print("=== POSITION CLOSED ===");
+               Print("Symbol: ", deal_symbol);
+               Print("Profit: $", DoubleToString(deal_profit, 2));
+               Print("Balance: $", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2));
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Custom function to handle errors                                 |
+//+------------------------------------------------------------------+
+void HandleError(int error_code, string function_name)
+{
+   Print("ERROR in ", function_name, ": ", error_code, " - ", ErrorDescription(error_code));
+}
+
+//+------------------------------------------------------------------+
+//| Get error description                                            |
+//+------------------------------------------------------------------+
+string ErrorDescription(int error_code)
+{
+   switch(error_code)
+   {
+      case 0: return "No error";
+      case 4014: return "Unknown symbol";
+      case 4051: return "Invalid function parameter value";
+      case 4066: return "History database busy";
+      case 4067: return "Some error in trading function";
+      default: return "Error code: " + IntegerToString(error_code);
+   }
+}
